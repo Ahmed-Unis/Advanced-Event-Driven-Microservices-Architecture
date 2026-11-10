@@ -1,0 +1,88 @@
+from flask import Flask
+import redis
+import socket
+import os
+import json
+from kafka import KafkaProducer
+
+app = Flask(__name__)
+
+# إعداد الاتصال بقاعدة بيانات Redis (للقراءة فقط - Read Pathredis_host = os.environ.get('REDIS_HOST', 'redis')
+redis_port = int(os.environ.get('REDIS_PORT', 6379))
+r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+
+# إعداد الاتصال بمنصة Redpanda (للكتابة وإرسال الأحداث - Write Path)
+broker_url = os.environ.get('REDPANDA_BROKER', 'redpanda:9092')
+topic_name = os.environ.get('TOPIC_NAME', 'visits-topic')
+
+producer = None
+
+def get_producer():
+    global producer
+    if producer is None:
+        producer = KafkaProducer(
+            bootstrap_servers=[broker_url],
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+    return producer
+
+@app.route('/')
+def index():
+    # جلب معرف الحاوية الحالية
+    container_id = socket.gethostname()
+    
+    # 1. مسار الكتابة (Write Path - Asynchronous Event Publishing):
+    # إرسال حدث الزيارة إلى Redpanda دون تعديل قاعدة البيانات مباشرة
+    try:
+        prod = get_producer()
+        event_data = {'container_id': container_id}
+        prod.send(topic_name, value=event_data)
+        prod.flush()
+    except Exception as e:
+        app.logger.error(f"Failed to publish event to Redpanda: {e}")
+
+    # 2. مسار القراءة (Read Path - Instant Query from Redis):
+    # قراءة القيم الحالية من Redis مباشرة بأقل زمن تأخير
+    global_count = r.get('global_counter') or 0
+    node_count = r.get(f'node_counter:{container_id}') or 0
+    
+    html_response = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Event-Driven Distributed System (Lab 2)</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; background-color: #f4f6f9; text-align: center; padding-top: 50px; }}
+            .card {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); display: inline-block; min-width: 380px; }}
+            h2 {{ color: #2c3e50; margin-bottom: 5px; }}
+            .subtitle {{ color: #7f8c8d; font-size: 0.9em; margin-bottom: 20px; }}
+            .stat {{ font-size: 1.2em; margin: 15px 0; padding: 10px; background: #eef2f5; border-radius: 5px; }}
+            .highlight {{ color: #e74c3c; font-weight: bold; font-size: 1.3em; }}
+            .node-id {{ color: #2980b9; font-family: monospace; font-weight: bold; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>Event-Driven Architecture (CQRS)</h2>
+            <div class="subtitle">Powered by Redpanda, Redis & Nginx</div>
+            <div class="stat">
+                Container ID (Hostname): <br>
+                <span class="node-id">{container_id}</span>
+            </div>
+            <div class="stat">
+                Global Visits: <br>
+                <span class="highlight">{global_count}</span>
+            </div>
+            <div class="stat">
+                Node Visits: <br>
+                <span class="highlight">{node_count}</span>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html_response
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
